@@ -19,12 +19,13 @@ package testsuites
 import (
 	"context"
 	"fmt"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	crdclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	crdclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 
@@ -476,10 +477,6 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 	})
 
 	f.It("should provision correct filesystem size when restoring snapshot to larger size pvc", feature.VolumeSnapshotDataSource, func(ctx context.Context) {
-		//TODO: remove skip when issue is resolved - https://github.com/kubernetes/kubernetes/issues/113359
-		if framework.NodeOSDistroIs("windows") {
-			e2eskipper.Skipf("Test is not valid Windows - skipping")
-		}
 
 		if pattern.VolMode == "Block" {
 			e2eskipper.Skipf("Test is not valid for Block volume mode - skipping")
@@ -1358,8 +1355,60 @@ func findVolumeMountPath(pod *v1.Pod, claim *v1.PersistentVolumeClaim) string {
 	return containerMountPath
 }
 
-// getFilesystemSizeBytes returns a total size of a filesystem on given mountPath inside a pod. You can use findVolumeMountPath for mountPath lookup.
-func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int, error) {
+// getFilesystemSizeBytes returns a total size of a filesystem on given mountPath inside a pod.
+// It detects the node's operating system (Windows or Linux) and executes the appropriate command
+// inside the target pod to determine the total capacity of the mounted volume's filesystem.
+// You can use findVolumeMountPath for mountPath lookup.
+func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int64, error) {
+
+	if framework.NodeOSDistroIs("windows") {
+		// --- WINDOWS Implementation: Use fsutil volume diskfree ---
+
+		// 1. Extract Drive Letter: Windows paths (mountPath) are expected to start with a drive letter,
+		// e.g., "C:\var\lib\kubelet\...". fsutil requires only the drive prefix (e.g., "C:").
+		if len(mountPath) < 2 || mountPath[1] != ':' {
+			return 0, fmt.Errorf("invalid Windows mount path: %q", mountPath)
+		}
+		drive := mountPath[:2] // e.g., "C:"
+
+		// 2. Execute fsutil Command: Run fsutil inside the pod to get disk usage statistics.
+		// We use cmd.exe /c to ensure the command executes correctly in the container environment.
+		out, err := e2ekubectl.RunKubectl(
+			pod.Namespace,
+			"exec", pod.Name, "--",
+			"cmd.exe", "/c",
+			fmt.Sprintf("fsutil volume diskfree %s", drive),
+		)
+		if err != nil {
+			return 0, fmt.Errorf("failed running fsutil: %w", err)
+		}
+
+		// 3. Parse Output: fsutil output uses Windows line endings (\r\n) and a specific format.
+		// Normalize line endings before splitting into lines.
+		// Output structure:
+		// Total # of bytes             : <total_bytes>
+		lines := strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+		if len(lines) < 2 {
+			return 0, fmt.Errorf("unexpected fsutil output: %q", out)
+		}
+
+		// The total size is on the second line (index 1).
+		// Use SplitN to isolate the value after the first colon, handling potential formatting variation.
+		parts := strings.SplitN(lines[1], ":", 2)
+		if len(parts) != 2 {
+			return 0, fmt.Errorf("unable to parse total bytes line: %q", lines[1])
+		}
+
+		// 4. Convert to int64: Extract the byte value and parse it as a 64-bit integer.
+		val := strings.TrimSpace(parts[1])
+		totalBytes, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parsing total bytes: %w", err)
+		}
+
+		return totalBytes, nil
+	}
+	// --- LINUX Implementation: Use 'stat' command ---
 	cmd := fmt.Sprintf("stat -f -c %%s %v", mountPath)
 	blockSize, err := e2ekubectl.RunKubectl(pod.Namespace, "exec", pod.Name, "--", "/bin/sh", "-c", cmd)
 	if err != nil {
@@ -1382,7 +1431,7 @@ func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int, error) {
 		return 0, err
 	}
 
-	return bs * bc, nil
+	return int64(bs * bc), nil
 }
 
 // MultiplePVMountSingleNodeCheck checks that multiple PV pointing to the same underlying storage can be mounted simultaneously on a single node.
